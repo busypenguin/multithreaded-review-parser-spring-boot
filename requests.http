@@ -1,0 +1,50 @@
+### Собрать русскоязычные отзывы из магазина Литрес
+POST http://localhost:8080/parse
+Content-Type: application/json
+
+{"url":"https://www.litres.ru/book/dzhordzh-oruell/1984-129098/otzivi/"}
+
+### Получить только отзывы Литрес
+GET http://localhost:8080/answer?source=https%3A%2F%2Fwww.litres.ru%2Fbook%2Fdzhordzh-oruell%2F1984-129098%2Fotzivi%2F&sort=rating&direction=desc
+
+### Собрать отзывы реального товара из интернет магазина
+POST http://localhost:8080/parse
+Content-Type: application/json
+
+{"url":"https://www.sweetwater.com/store/detail/SM58--shure-sm58-cardioid-dynamic-vocal-microphone/reviews"}
+
+### Получить только отзывы этого товара
+GET http://localhost:8080/answer?source=https%3A%2F%2Fwww.sweetwater.com%2Fstore%2Fdetail%2FSM58--shure-sm58-cardioid-dynamic-vocal-microphone%2Freviews&sort=rating&direction=desc
+
+### Собрать отзывы с реального товара IRecommend
+POST http://localhost:8080/parse
+Content-Type: application/json
+
+{"url":"https://irecommend.ru/content/naushniki-apple-airpods"}
+
+### Запустить демонстрационный сбор
+POST http://localhost:8080/parse
+Content-Type: application/json
+
+{"url":"http://localhost:8080/demo/product?page=1"}
+
+### Подставить идентификатор из ответа
+GET http://localhost:8080/jobs/replace-with-job-id
+
+### Получить отзывы по убыванию рейтинга
+GET http://localhost:8080/answer?sort=rating&direction=desc
+
+### Получить отзывы по автору
+GET http://localhost:8080/answer?sort=author&direction=asc
+
+### Проверить ошибку ссылки
+POST http://localhost:8080/parse
+Content-Type: application/json
+
+{"url":"wrong"}
+
+### Реальная страница Отзовика. Сайт может потребовать капчу
+POST http://localhost:8080/parse
+Content-Type: application/json
+
+{"url":"https://otzovik.com/reviews/naushniki_apple_airpods_5/"}

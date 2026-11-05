@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Парсер отзывов</title>
+<style>
+body {font: 17px system-ui; max-width: 960px; margin: 40px auto; padding: 0 20px; color: #243044; background: #f6f8fc}
+input,button,select {font: inherit; padding: 10px; margin: 5px 0} input {width: min(95%,700px)}
+button {cursor: pointer} pre {white-space: pre-wrap; overflow-wrap: anywhere; padding: 15px; background: white}
+table {width: 100%; border-collapse: collapse; background: white} td,th {padding: 12px; text-align: left; border-bottom: 1px solid #dde}
+</style>
+<h1>Парсер отзывов</h1>
+<p>Запустите сбор и дождитесь результата. Локальный пример содержит три отзыва на трёх страницах и работает без внешнего сайта.</p>
+<input id="url" aria-label="Ссылка на товар">
+<button id="start">Собрать отзывы</button>
+<p id="status" role="status">Готов к запуску</p>
+<label>Сортировка <select id="sort"><option value="date">Дата</option><option value="rating">Рейтинг</option><option value="author">Автор</option></select></label>
+<select id="direction" aria-label="Направление"><option value="desc">По убыванию</option><option value="asc">По возрастанию</option></select>
+<button id="load">Получить результаты</button>
+<table><thead><tr><th>Автор</th><th>Отзыв</th><th>Рейтинг</th><th>Дата</th></tr></thead><tbody id="rows"></tbody></table>
+<h2>Проверка через HTTP</h2>
+<pre>POST http://localhost:8080/parse
+Content-Type: application/json
+
+{"url":"http://localhost:8080/demo/product?page=1"}
+
+GET http://localhost:8080/jobs/идентификаторИзОтвета
+GET http://localhost:8080/answer?sort=rating&amp;direction=desc</pre>
+<p>Статус RUNNING означает сбор, DONE означает завершение, FAILED содержит описание ошибки. Каждую минуту выполняется повторный сбор успешно обработанных ссылок. Повторные отзывы не добавляются в базу.</p>
+<p>Внешние страницы поддерживаются при наличии отзывов Schema.org JSON LD с текстом, автором, рейтингом от одного до пяти и датой. Также добавлен разбор HTML карточек Отзовика. Страницы, требующие JavaScript, авторизации или прохождения капчи, не поддерживаются. Полный текст доступен только тогда, когда он присутствует в полученном HTML. Разбираются первая страница и до девяти ссылок пагинации с неё.</p>
+<script>
+const url = document.getElementById('url');
+const status = document.getElementById('status');
+const start = document.getElementById('start');
+url.value = new URLSearchParams(location.search).get('url') || location.origin + '/demo/product?page=1';
+async function request(path, options) {
+    const response = await fetch(path, options);
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.message || 'Ошибка запроса');
+    return result;
+}
+async function load() {
+    const reviews = await request('/answer?source=' + encodeURIComponent(url.value) + '&sort=' + document.getElementById('sort').value + '&direction=' + document.getElementById('direction').value);
+    const rows = document.getElementById('rows');
+    rows.replaceChildren();
+    for (const review of reviews) {
+        const row = rows.insertRow();
+        for (const value of [review.author, review.text, review.rating, review.date]) row.insertCell().textContent = value;
+    }
+}
+start.onclick = async () => {
+    start.disabled = true;
+    try {
+        let job = await request('/parse', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url: url.value})});
+        while (job.status === 'RUNNING') {
+            status.textContent = 'Сбор отзывов. Обработано ' + job.count;
+            await new Promise(resolve => setTimeout(resolve, 500));
+            job = await request('/jobs/' + job.id);
+        }
+        status.textContent = job.status + '. Обработано ' + job.count + '. ' + job.error;
+        await load();
+    } catch (error) { status.textContent = error.message; }
+    finally { start.disabled = false; }
+};
+document.getElementById('load').onclick = () => load().catch(error => status.textContent = error.message);
+load().catch(error => status.textContent = error.message);
+</script>
+</html>
