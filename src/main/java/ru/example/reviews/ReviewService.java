@@ -1,6 +1,8 @@
 package ru.example.reviews;
 
 import java.net.URI;
+import java.io.IOException;
+import jakarta.annotation.PreDestroy;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -16,22 +18,33 @@ import org.slf4j.LoggerFactory;
 public class ReviewService {
     private static final Logger log = LoggerFactory.getLogger(ReviewService.class);
     public record Job(String id, String url, String status, int count, String error) {}
+    private record Running(Job job, Thread thread) {}
     private final ConcurrentHashMap<String, Job> jobs = new ConcurrentHashMap<>();
-    private final AtomicInteger active = new AtomicInteger();
+    private final Set<String> sources = ConcurrentHashMap.newKeySet();
+    private final Map<String, Running> activeJobs = new HashMap<>();
     private final ExecutorService executor;
     private final ReviewParser parser;
     private final ReviewRepository repository;
+    private final FileStorage files;
+    private boolean stopping;
 
-    public ReviewService(ExecutorService executor, ReviewParser parser, ReviewRepository repository) {
+    public ReviewService(ExecutorService executor, ReviewParser parser, ReviewRepository repository,
+                         FileStorage files) {
         this.executor = executor;
         this.parser = parser;
         this.repository = repository;
+        this.files = files;
     }
 
-    public Job start(String url) {
+    // Проверка и регистрация задания выполняются под одной блокировкой.
+    public synchronized Job start(String url) {
         validate(url);
-        if (active.incrementAndGet() > 8) {
-            active.decrementAndGet();
+        if (stopping) {
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Приложение останавливается");
+        }
+        Running existing = activeJobs.get(url);
+        if (existing != null) return jobs.get(existing.job().id());
+        if (activeJobs.size() >= 8) {
             throw new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "Уже выполняется восемь заданий");
         }
         if (jobs.size() >= 100) {
@@ -39,55 +52,77 @@ public class ReviewService {
         }
         String id = UUID.randomUUID().toString();
         Job job = new Job(id, url, "RUNNING", 0, "");
+        Runnable task = () -> collect(job);
+        Thread thread = new Thread(task, "review-job-" + id);
+        thread.setDaemon(false);
+        activeJobs.put(url, new Running(job, thread));
         jobs.put(id, job);
         log.info("Запуск задания {} для {}", id, url);
-        try {
-            executor.execute(() -> collect(job));
-        } catch (RejectedExecutionException e) {
-            finish(job, 0, "Очередь заполнена");
-        }
+        thread.start();
         return job;
     }
 
     private void collect(Job job) {
         AtomicInteger count = new AtomicInteger();
+        String error = "";
+        boolean firstLoaded = false;
+        files.log("Начало задания " + job.id() + ". Поток " + Thread.currentThread().getName()
+                + ". daemon=" + Thread.currentThread().isDaemon() + ". " + job.url());
         try {
-            Document first = parser.load(job.url());
-            save(first, job, count);
-            List<CompletableFuture<Void>> tasks = new ArrayList<>();
+            Document first = executor.submit(() -> {
+                Document document = parser.load(job.url());
+                save(document, job, count);
+                return document;
+            }).get();
+            firstLoaded = true;
+            List<Callable<Void>> tasks = new ArrayList<>();
             for (String page : parser.pages(first, job.url())) {
-                tasks.add(CompletableFuture.runAsync(() -> save(parser.load(page), job, count), executor));
+                tasks.add(() -> {
+                    save(parser.load(page), job, count);
+                    return null;
+                });
             }
-            CompletableFuture.allOf(tasks.toArray(CompletableFuture[]::new))
-                    .whenComplete((result, error) -> finish(job, count.get(),
-                            error == null ? "" : "Не удалось загрузить одну из страниц. Доступные отзывы сохранены"));
-        } catch (org.springframework.web.client.RestClientResponseException e) {
-            log.warn("Сайт {} вернул HTTP {}", job.url(), e.getStatusCode());
-            String error = e.getResponseBodyAsString().contains("captcha")
-                    ? "Сайт требует капчу. Автоматический сбор недоступен"
-                    : "Сайт вернул HTTP " + e.getStatusCode().value();
-            finish(job, count.get(), error);
+            // Обычный поток ожидает пул. Сами потоки пула друг друга не ожидают.
+            for (Future<Void> result : executor.invokeAll(tasks)) result.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            error = "Сбор остановлен";
         } catch (Exception e) {
-            log.warn("Ошибка сбора для {}", job.url(), e);
-            finish(job, count.get(), "Не удалось прочитать страницу. Проверьте ссылку и доступность сайта");
+            Throwable cause = e instanceof ExecutionException ? e.getCause() : e;
+            log.warn("Ошибка сбора для {}. {}", job.url(), cause.getClass().getSimpleName());
+            if (firstLoaded) {
+                error = "Не удалось загрузить одну из страниц. Доступные отзывы сохранены";
+            } else if (cause instanceof org.springframework.web.client.RestClientResponseException response) {
+                error = response.getResponseBodyAsString().contains("captcha")
+                        ? "Сайт требует капчу. Автоматический сбор недоступен"
+                        : "Сайт вернул HTTP " + response.getStatusCode().value();
+            } else {
+                error = "Не удалось прочитать страницу. Проверьте ссылку и доступность сайта";
+            }
+        } finally {
+            finish(job, count.get(), error);
         }
     }
 
-    private void save(Document document, Job job, AtomicInteger count) {
+    private void save(Document document, Job job, AtomicInteger count) throws IOException {
         for (Review review : parser.parse(document, job.url())) {
             repository.save(review);
+            files.save(review);
             int current = count.incrementAndGet();
             jobs.computeIfPresent(job.id(), (id, old) -> new Job(id, job.url(), "RUNNING", Math.max(current, old.count()), ""));
         }
     }
 
-    private void finish(Job job, int count, String error) {
+    private synchronized void finish(Job job, int count, String error) {
         if (error.isEmpty() && count == 0) {
             error = "Отзывы не найдены. Страница может требовать JavaScript или иметь другую разметку";
         }
         jobs.put(job.id(), new Job(job.id(), job.url(), error.isEmpty() ? "DONE" : "FAILED", count, error));
+        if (error.isEmpty()) sources.add(job.url());
+        files.log("Задание " + job.id() + ". " + jobs.get(job.id()).status()
+                + ". Обработано " + count + ". " + job.url() + ". " + error);
         log.info("Задание {} завершено. Обработано {}. {}", job.id(), count, error);
-        active.decrementAndGet();
+        activeJobs.remove(job.url());
     }
 
     public Job job(String id) {
@@ -126,17 +161,27 @@ public class ReviewService {
         }
     }
 
-    @Scheduled(initialDelay = 60000, fixedDelay = 60000)
+    @Scheduled(initialDelayString = "${reviews.refresh-ms:60000}", fixedDelayString = "${reviews.refresh-ms:60000}")
     public void refresh() {
-        // Повторяем сбор только после завершения предыдущего задания по ссылке.
-        Set<String> sources = new HashSet<>();
-        jobs.values().stream().filter(job -> job.status().equals("DONE"))
-                .forEach(job -> sources.add(job.url()));
         for (String source : sources) {
-            if (active.get() < 8 && jobs.values().stream().noneMatch(job ->
-                    job.url().equals(source) && job.status().equals("RUNNING"))) {
+            try {
                 start(source);
+            } catch (ResponseStatusException e) {
+                if (e.getStatusCode() == HttpStatus.TOO_MANY_REQUESTS
+                        || e.getStatusCode() == HttpStatus.SERVICE_UNAVAILABLE) return;
+                throw e;
             }
         }
+    }
+
+    @PreDestroy
+    public void stop() throws InterruptedException {
+        List<Thread> threads;
+        synchronized (this) {
+            stopping = true;
+            threads = activeJobs.values().stream().map(Running::thread).toList();
+        }
+        // Сначала завершаем задания, затем Spring закрывает пул, файлы и базу.
+        for (Thread thread : threads) thread.join();
     }
 }

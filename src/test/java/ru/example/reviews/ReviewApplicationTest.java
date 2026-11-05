@@ -1,6 +1,7 @@
 package ru.example.reviews;
 
 import java.time.Duration;
+import java.nio.file.*;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -13,7 +14,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
-        "spring.datasource.url=jdbc:h2:mem:test;DB_CLOSE_DELAY=-1"
+        "spring.datasource.url=jdbc:h2:mem:test;DB_CLOSE_DELAY=-1",
+        "reviews.files-directory=./target/test-data",
+        "reviews.refresh-ms=200"
 })
 class ReviewApplicationTest {
     @Autowired TestRestTemplate http;
@@ -24,15 +27,28 @@ class ReviewApplicationTest {
         String url = "http://localhost:" + port + "/demo/product?page=1";
         collect(url);
         collect(url);
-        Review[] reviews = http.getForObject("/answer?sort=rating&direction=desc", Review[].class);
+        Review[] reviews = http.getForObject("/answer?source={source}&sort=rating&direction=desc", Review[].class, url);
         assertThat(reviews).hasSize(3);
         assertThat(List.of(reviews).stream().map(Review::rating).toList()).containsExactly(5.0, 4.0, 3.0);
         assertThat(reviews[0].author()).isEqualTo("Анна");
         assertThat(reviews[0].text()).isEqualTo("Товар пришел вовремя. Все работает.");
         assertThat(reviews[0].date()).isEqualTo("2026-10-01");
         assertThat(http.getForObject("/answer?source=missing", Review[].class)).isEmpty();
-        Review[] byAuthor = http.getForObject("/answer?sort=author&direction=asc", Review[].class);
+        Review[] byAuthor = http.getForObject("/answer?source={source}&sort=author&direction=asc", Review[].class, url);
         assertThat(List.of(byAuthor).stream().map(Review::author).toList()).containsExactly("Анна", "Борис", "Вера");
+    }
+
+    @Test
+    void scheduledRefreshRunsAutomaticallyAndWritesFiles() {
+        String url = "http://localhost:" + port + "/demo/product?page=3";
+        collect(url);
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+            List<String> journal = Files.readAllLines(Path.of("target/test-data/jobs.log"));
+            long completed = journal.stream().filter(line -> line.contains(". DONE.") && line.contains(url)).count();
+            assertThat(completed).isGreaterThanOrEqualTo(2);
+            assertThat(String.join("\n", journal)).contains("daemon=true", "daemon=false");
+            assertThat(Files.readString(Path.of("target/test-data/reviews.jsonl"))).contains("Анна", "Товар пришел вовремя");
+        });
     }
 
     private void collect(String url) {
