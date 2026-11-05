@@ -1,0 +1,8 @@
+CREATE TABLE IF NOT EXISTS reviews (
+    id VARCHAR(64) PRIMARY KEY,
+    source VARCHAR(2048) NOT NULL,
+    author VARCHAR(500) NOT NULL,
+    review_text CLOB NOT NULL,
+    rating DOUBLE PRECISION NOT NULL,
+    review_date VARCHAR(40) NOT NULL
+);
